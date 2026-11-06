@@ -11,7 +11,7 @@ import yaml
 
 from tc.cli import parse_args
 from tc.jobs import load_job, Train, Generate, Prepare, Evaluate
-from tc.job import archive_source, make_record, repository_url, write_record
+from tc.job_utils import archive_source, repository_url, write_record
 
 
 class ConfigTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class ConfigTests(unittest.TestCase):
         for cls, values in ((Train, {"steps": True}), (Train, {"steps": 0}),
                             (Train, {"retain_step": [0]}), (Train, {"input": "rows.jsonl"}),
                             (Generate, {"responses": 0}), (Generate, {"top_p": float("nan")}),
-                            (Prepare, {"count": 0}), (Prepare, {"dataset_revision": "abc"}),
+                            (Prepare, {"count": 0}), (Prepare, {"count": True}),
                             (Evaluate, {"workers": 0}), (Evaluate, {"sandbox": "unknown"})):
             with self.subTest(job=cls.__name__, values=values), self.assertRaises(ValueError):
                 cls(**values)
@@ -64,13 +64,13 @@ class ConfigTests(unittest.TestCase):
             git("commit", "-qm", "base")
             commit = git("rev-parse", "HEAD")
             resolve = lambda kind, name, revision: "a" * 40
-            with patch("tc.job.UPSTREAM_COMMIT", commit):
-                args = Train(algorithm="dpo")
-                record = make_record(args, repo, resolve)
+            with patch("tc.job_utils.UPSTREAM_COMMIT", commit):
+                args = Train(algorithm="dpo", name="experiment")
+                record = args.make_record(repo, resolve)
                 self.assertEqual(record["source_commit"], commit)
                 self.assertEqual(record["original_argv"], [])
                 self.assertEqual(record["revisions"]["reference"], record["revisions"]["model"])
-                self.assertNotEqual(record["job_id"], make_record(args, repo, resolve)["job_id"])
+                self.assertNotEqual(record["job_id"], args.make_record(repo, resolve)["job_id"])
                 out = Path(tmp) / "job"
                 write_record(record, out)
                 self.assertEqual(yaml.safe_load((out / "config.yaml").read_text()), record)
@@ -78,11 +78,11 @@ class ConfigTests(unittest.TestCase):
                     write_record(record, out)
                 (repo / "untracked.py").write_text("secret = True\n")
                 with self.assertRaisesRegex(ValueError, "committed source"):
-                    make_record(args, repo, resolve)
+                    args.make_record(repo, resolve)
                 (repo / "untracked.py").unlink()
                 (repo / "worker.py").write_text("answer = 0\n")
                 with self.assertRaisesRegex(ValueError, "committed source"):
-                    make_record(args, repo, resolve)
+                    args.make_record(repo, resolve)
                 archive = Path(tmp) / "source.tar"
                 archive_source(record, repo, archive)
                 with tarfile.open(archive) as source:

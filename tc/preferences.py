@@ -4,16 +4,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import json
+import math
 import yaml
 
-from tc.data import select, strict_pairs
+from tc.data import select, strict_pairs, shortest_pairs
 from tc.job_utils import read_rows
 
 
 @dataclass
 class PreferenceGroups:
-    """Verify graded generations and select groups containing strict preferences."""
+    """Select strict or shortest-correct preferences from verified grades or archived token groups."""
     input: str = ""
+    source: str = "evaluation"
+    pairing: str = "all"
+    correct_ratio: float = 1.5
+    wrong_ratio: float = 1.0
     split: str = "train"
     count: int | None = None
     seed: int = 42
@@ -21,6 +26,12 @@ class PreferenceGroups:
 
     def __post_init__(self) -> None:
         """Reject invalid selection settings before training starts."""
+        if self.source not in ("evaluation", "groups") or self.pairing not in ("all", "shortest"):
+            raise ValueError("invalid preference source or pairing")
+        if type(self.correct_ratio) not in (int, float) or not math.isfinite(self.correct_ratio) or self.correct_ratio <= 1:
+            raise ValueError("correct_ratio must be finite and greater than one")
+        if type(self.wrong_ratio) not in (int, float) or not math.isfinite(self.wrong_ratio) or self.wrong_ratio < 1:
+            raise ValueError("wrong_ratio must be finite and at least one")
         if type(self.input) is not str or type(self.split) is not str or type(self.seed) is not int:
             raise ValueError("invalid preference input, split or seed")
         if self.count is not None and (type(self.count) is not int or self.count <= 0):
@@ -32,6 +43,23 @@ class PreferenceGroups:
         """Join complete grades to original tokens and select usable groups."""
         if not self.input:
             raise ValueError("groups.input requires an evaluation job directory")
+        if self.source == "groups":
+            groups = read_rows(Path(self.input))
+        else:
+            groups = self.graded_groups()
+        selected = []
+        for group in groups:
+            pairs = shortest_pairs(group["responses"], self.correct_ratio, self.wrong_ratio) if self.pairing == "shortest" else strict_pairs(group["responses"])
+            if pairs:
+                group = {key: value for key, value in group.items() if key != "pairs"}
+                selected.append(dict(group, pairs=pairs) if self.pairing == "shortest" else group)
+        groups = select(selected, split=self.split, exclude=self.exclude, count=self.count, seed=self.seed)
+        if not groups:
+            raise ValueError("no training signal in selected responses")
+        return groups
+
+    def graded_groups(self) -> list[dict[str, Any]]:
+        """Verify a complete evaluation against its original saved generation."""
         evaluation = Path(self.input)
         if json.loads((evaluation / "status.json").read_text())["state"] != "completed":
             raise ValueError("evaluation is not completed")
@@ -65,9 +93,6 @@ class PreferenceGroups:
             if strict_pairs(responses):
                 groups.append({"id": question["id"], "split": question["split"],
                                "prompt_tokens": prompt["token_ids"], "responses": responses})
-        groups = select(groups, split=self.split, exclude=self.exclude, count=self.count, seed=self.seed)
-        if not groups:
-            raise ValueError("no training signal in selected responses")
         return groups
 
     @staticmethod

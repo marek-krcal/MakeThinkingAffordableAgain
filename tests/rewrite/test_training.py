@@ -45,7 +45,7 @@ class TrainingTests(unittest.TestCase):
         for algorithm in ('simpo', 'dpo'):
             with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                args = load_job({'command': 'train', 'algorithm': algorithm, 'steps': 4, 'batch_size': 2, 'checkpoint_every': 1, 'retain_step': [2], 'learning_rate': 0.001, 'device': 'cpu'})
+                args = load_job({'command': 'train', 'algorithm': algorithm, 'steps': 4, 'batch_size': 2, 'checkpoint_every': 1, 'retain_step': [1], 'learning_rate': 0.001, 'device': 'cpu'})
                 full, interrupted, resumed = [root / name for name in ('full', 'interrupted', 'resumed')]
                 for path in (full, interrupted, resumed):
                     (path / 'outputs').mkdir(parents=True)
@@ -61,7 +61,10 @@ class TrainingTests(unittest.TestCase):
                         return models[-1]
                     def update(path, **fields):
                         progress(path, **fields)
-                        if interrupt and fields.get('step') == 2:
+                        if fields.get('step'):
+                            safety = [p.name for p in (path/'checkpoints').glob('step-*') if p.name not in ('step-1', 'step-4')]
+                            self.assertLessEqual(len(safety), 1)
+                        if interrupt and fields.get('step') == 3:
                             raise InterruptedError()
                     with patch('tc.preferences.PreferenceGroups.form_groups', return_value=groups()), patch.object(args, 'execution_context', execution), patch('transformers.AutoModelForCausalLM.from_pretrained', load), patch('peft.get_peft_model', side_effect=lambda m, c: m), patch('tc.train.progress', update):
                         args.execute()
@@ -72,7 +75,9 @@ class TrainingTests(unittest.TestCase):
                 self.assertTrue(any(not torch.equal(initial[n], p) for n, p in original.named_parameters() if n in initial))
                 with self.assertRaises(InterruptedError):
                     run(interrupted, interrupt=True)
-                args.resume = str(interrupted / 'checkpoints/step-2')
+                self.assertEqual({p.name for p in (full/'checkpoints').iterdir()}, {'step-1', 'step-4'})
+                self.assertEqual({p.name for p in (interrupted/'checkpoints').iterdir()}, {'step-1', 'step-3'})
+                args.resume = str(interrupted / 'checkpoints/step-3')
                 recovered = run(resumed)
                 for (name, expected), (_, actual) in zip(original.named_parameters(), recovered.named_parameters()):
                     torch.testing.assert_close(expected, actual, atol=0, rtol=0, msg=name)

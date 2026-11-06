@@ -49,3 +49,16 @@ def strict_pairs(responses: list[dict[str, Any]]) -> list[tuple[int, int]]:
             ):
                 pairs.append((i, j))
     return pairs
+
+
+def shortest_pairs(responses: list[dict[str, Any]], correct_ratio: float = 1.5,
+                   wrong_ratio: float = 1.0) -> list[tuple[int, int]]:
+    """Pair the shortest correct answer with longer wrong or sufficiently longer correct answers."""
+    correct = [i for i, response in enumerate(responses) if response.get("correct") is True]
+    if not correct:
+        return []
+    chosen = min(correct, key=lambda i: (response_length(responses[i]), responses[i]["sample_index"]))
+    length = response_length(responses[chosen])
+    return [(chosen, i) for i, response in enumerate(responses)
+            if response_length(response) > length and ((response.get("correct") is False and response_length(response) >= wrong_ratio * length) or
+               (response.get("correct") is True and response_length(response) >= correct_ratio * length))]

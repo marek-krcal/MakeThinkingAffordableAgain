@@ -146,7 +146,8 @@ class Train(ModelJob):
             checkpoint_dir = Path(directory) / "checkpoints"
             checkpoint_dir.mkdir()
             retained = set(self.retain_step if self.retain_step is not None else
-                           ([737, 982] if len(schedule) == 982 else [len(schedule)]))
+                           ([737, 860, 982] if len(schedule) == 982 else [len(schedule)]))
+            retained.add(len(schedule))
             model.train()
             for offset in range(start, len(schedule)):
                 check_stop(directory)
@@ -172,10 +173,13 @@ class Train(ModelJob):
                     progress(directory, checkpoint=f"checkpoints/step-{step}")
                     safety = sorted((p for p in checkpoint_dir.glob("step-*") if int(p.name[5:]) not in retained),
                                     key=lambda p: int(p.name[5:]))
-                    for old in safety[:-2]:
+                    for old in safety[:-1]:
                         shutil.rmtree(old)
                 log.write(json.dumps({"step": step, "loss": loss_value}) + "\n")
                 log.flush()
                 progress(directory, step=step, total_steps=len(schedule), loss=loss_value)
             model.save_pretrained(Path(directory) / "outputs/adapter")
+            for checkpoint in checkpoint_dir.glob("step-*"):
+                if int(checkpoint.name[5:]) not in retained:
+                    shutil.rmtree(checkpoint)
             artifacts.extend([Path(directory) / "outputs/adapter", checkpoint_dir])

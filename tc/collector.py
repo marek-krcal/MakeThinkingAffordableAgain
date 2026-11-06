@@ -28,6 +28,7 @@ class Collector:
     total_steps: int = 982
     retain_steps: list[int] = field(default_factory=lambda: [737, 982])
     snapshot_files: list[str] = field(default_factory=list)
+    checkpoint_archives: str | None = None
     interval: float = 90
 
     def save(self, path: str | Path) -> None:
@@ -45,11 +46,11 @@ class Collector:
         JOB=self.remote_job_dir
         CLI=[self.executable,'--auth',self.auth,'--config',self.session_file]
         ENV=os.environ.copy()
-        def call(*args: str) -> bool:
+        def call(*args: str, timeout: int = 180) -> bool:
             """Run a session-specific command and record redacted transport failures."""
             record={'time':time.time(),'operation':args[0]}
             try:
-                p=subprocess.run(CLI+list(args)+['--session',SESSION],env=ENV,capture_output=True,timeout=180)
+                p=subprocess.run(CLI+list(args)+['--session',SESSION],env=ENV,capture_output=True,timeout=timeout)
                 record['returncode']=p.returncode
                 if p.returncode:
                     message=(p.stdout+p.stderr).decode(errors='replace')[-4000:]
@@ -59,7 +60,7 @@ class Collector:
                     record['error']=message
                 return p.returncode==0
             except subprocess.TimeoutExpired:
-                record['error']='TimeoutExpired after 180 seconds'
+                record['error']=f'TimeoutExpired after {timeout} seconds'
                 return False
             finally:
                 with (OUT/'transport.jsonl').open('a') as stream:
@@ -84,9 +85,11 @@ class Collector:
             script=OUT/'archive_remote.py'
             script.write_text(archive_script(remote, '/content/'+name+'.tar.gz',
                                              self.remote_console if remote == self.remote_diagnostics else None))
-            if not call('exec','--file',str(script)): return False
+            prebuilt = self.checkpoint_archives if name.startswith('checkpoint-') else None
+            if not prebuilt and not call('exec','--timeout','120','--file',str(script)): return False
+            remote_archive = str(Path(prebuilt) / (name+'.tar.gz')) if prebuilt else '/content/'+name+'.tar.gz'
             temporary=destination.with_suffix('.partial')
-            if not call('download','/content/'+name+'.tar.gz',str(temporary)): return False
+            if not call('download',remote_archive,str(temporary),timeout=900): return False
             import tarfile
             try:
                 with tarfile.open(temporary) as t:

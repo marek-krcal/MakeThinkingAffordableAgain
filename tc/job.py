@@ -118,6 +118,7 @@ class Job:
             write_json(directory / "artifacts.json", [str(p.relative_to(directory)) for p in artifacts])
             status["state"] = "completed"
         except BaseException as error:
+            (directory / "traceback.txt").write_text(traceback.format_exc())
             status.update(state="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
                           error=str(error))
             raise

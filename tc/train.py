@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import ClassVar
 import math
-from tc.config import Job, ModelJob
+from tc.job import Job, ModelJob
 
 
 @dataclass

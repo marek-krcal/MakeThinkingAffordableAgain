@@ -5,3 +5,6 @@ Install `requirements-tc.txt`. Jobs are serializable dataclasses exposed by `tc.
 and source/model revisions. Worker execution is added in later PRs.
 
 Run tests with `python -m unittest discover -s tests/rewrite`.
+
+Jobs execute in the current Python runtime; Colab is the supported production environment.
+Use a clean committed checkout. CPU fixtures also run in CI.

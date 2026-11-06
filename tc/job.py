@@ -35,13 +35,13 @@ def repository_url(remote: str) -> str:
     return "https://github.com/" + path
 
 
-def source_identity(repo: str | Path, remote: bool = True) -> dict[str, Any]:
-    """Record the executing commit and reject dirty remote job sources."""
+def source_identity(repo: str | Path) -> dict[str, Any]:
+    """Record the executing commit and require a clean checkout."""
     commit = git(repo, "rev-parse", "HEAD")
     git(repo, "merge-base", "--is-ancestor", UPSTREAM_COMMIT, commit)
     dirty = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
-    if remote and dirty:
-        raise ValueError("remote jobs require committed source; commit or remove working changes")
+    if dirty:
+        raise ValueError("jobs require committed source; commit or remove working changes")
     return {
         "repository_url": repository_url(git(repo, "remote", "get-url", "origin")),
         "source_commit": commit,
@@ -83,7 +83,7 @@ def make_record(args: Any, repo: str | Path, resolve: Any=resolve_revision, pare
         "name": args.name or args.command,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "parent_id": parent_id,
-        **source_identity(repo, remote=not args.local),
+        **source_identity(repo),
         "original_argv": list(getattr(args, "original_argv", [])),
         "arguments": args.config(),
         "revisions": resolved_revisions(args, resolve),

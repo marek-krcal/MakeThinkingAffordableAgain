@@ -18,7 +18,7 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_inputs(self):
         for values in ({'steps': 1, 'epochs': 1}, {'algorithm': 'dpo', 'gamma': 1},
                        {'steps': 0}, {'steps': True}, {'mod': 'foo'}, {'beta': float('nan')},
-                       {'input': 'file.jsonl'}, {'local': 'false'}):
+                       {'input': 'file.jsonl'}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 load_job({'command': 'train', **values})
 
@@ -83,8 +83,6 @@ class ConfigTests(unittest.TestCase):
                 (repo / "worker.py").write_text("answer = 0\n")
                 with self.assertRaisesRegex(ValueError, "committed source"):
                     make_record(args, repo, resolve)
-                args.local = True
-                self.assertTrue(make_record(args, repo, resolve)["source_dirty"])
                 archive = Path(tmp) / "source.tar"
                 archive_source(record, repo, archive)
                 with tarfile.open(archive) as source:

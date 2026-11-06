@@ -11,6 +11,7 @@ import yaml
 
 from tc.cli import parse_args
 from tc.jobs import load_job, Train, Generate, Prepare, Evaluate
+from tc.preferences import PreferenceGroups
 from tc.job_utils import archive_source, repository_url, write_record
 
 
@@ -24,7 +25,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_direct_construction_rejects_invalid_configuration(self):
         for cls, values in ((Train, {"steps": True}), (Train, {"steps": 0}),
-                            (Train, {"retain_step": [0]}), (Train, {"input": "rows.jsonl"}),
+                            (Train, {"retain_step": [0]}), (Train, {"groups": {"count": True}}),
                             (Generate, {"responses": 0}), (Generate, {"top_p": float("nan")}),
                             (Prepare, {"count": 0}), (Prepare, {"count": True}),
                             (Evaluate, {"workers": 0}), (Evaluate, {"sandbox": "unknown"})):
@@ -34,7 +35,7 @@ class ConfigTests(unittest.TestCase):
     def test_yaml_and_cli_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'job.yaml'
-            job = Train(algorithm='dpo', epochs=2, input=['groups.jsonl'])
+            job = Train(algorithm='dpo', epochs=2, groups=PreferenceGroups(input='runs/graded'))
             job.save(path)
             loaded = parse_args(['--name=experiment', str(path)])
             self.assertEqual(loaded.name, 'experiment')

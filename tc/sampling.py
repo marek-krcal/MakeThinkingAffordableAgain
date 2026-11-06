@@ -31,6 +31,13 @@ def views(group: dict[str, Any], epoch: int) -> Any:
         raise ValueError("duplicate response sample index")
     if any(type(r["correct"]) is not bool or not r["completion_tokens"] for r in responses):
         raise ValueError("boolean grades and nonempty completion tokens required")
+    if "pairs" in group:
+        pairs = group["pairs"]
+        valid = set(strict_pairs(responses))
+        if not pairs or len({tuple(pair) for pair in pairs}) != len(pairs) or any(tuple(pair) not in valid for pair in pairs):
+            raise ValueError("invalid explicit preference pairs")
+        return [dict(group, responses=[responses[i], responses[j]], pairs=[(0, 1)],
+                     selection_epoch=epoch, tuple_side=side) for side, (i, j) in enumerate(pairs)]
     if not strict_pairs(responses):
         return []
     correct = sorted((r for r in responses if r["correct"]),

@@ -17,7 +17,6 @@ class Job:
     """Serializable settings shared by concrete jobs."""
     command: ClassVar[str]
     name: str = ""
-    local: bool = False
     jobs_dir: str = "runs"
     input: list[str] = field(default_factory=list)
 

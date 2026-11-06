@@ -81,3 +81,38 @@ class TrainingTests(unittest.TestCase):
                 recovered = run(resumed)
                 for (name, expected), (_, actual) in zip(original.named_parameters(), recovered.named_parameters()):
                     torch.testing.assert_close(expected, actual, atol=0, rtol=0, msg=name)
+
+    def test_loss_scale_overflow_retries_without_consuming_an_update(self):
+        scaler_class = torch.amp.GradScaler
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = load_job(dict(command='train', steps=4, batch_size=2, checkpoint_every=4, device='cpu', learning_rate=.001))
+            def run(name, overflow):
+                directory = root / name
+                (directory / 'outputs').mkdir(parents=True)
+                instances = []
+                injected = []
+                def load(*a, **kw):
+                    current = model()
+                    if overflow:
+                        parameter = next(p for p in current.parameters() if p.requires_grad)
+                        def corrupt_once(gradient):
+                            if not injected:
+                                injected.append(True)
+                                return torch.full_like(gradient, float('inf'))
+                            return gradient
+                        parameter.register_hook(corrupt_once)
+                    instances.append(current)
+                    return current
+                @contextmanager
+                def execution():
+                    yield ExecutionContext(directory, dict(arguments=args.config(), revisions={"model": {"id": "test", "revision": "a"*40}}))
+                with patch.object(args, 'execution_context', execution), patch('tc.preferences.PreferenceGroups.form_groups', return_value=groups()), patch('transformers.AutoModelForCausalLM.from_pretrained', load), patch('peft.get_peft_model', side_effect=lambda m,c:m), patch('torch.amp.GradScaler', side_effect=lambda *a,**kw:scaler_class('cpu', init_scale=8.)):
+                    args.execute()
+                self.assertEqual(len((directory/'log.txt').read_text().splitlines()), 4)
+                if overflow:
+                    self.assertEqual(injected, [True])
+                return instances[0]
+            baseline, recovered = run('baseline', False), run('overflow', True)
+            for (_, expected), (_, actual) in zip(baseline.named_parameters(), recovered.named_parameters()):
+                torch.testing.assert_close(expected, actual, atol=0, rtol=0)

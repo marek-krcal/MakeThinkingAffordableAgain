@@ -66,3 +66,40 @@ class SavedEvaluationTests(unittest.TestCase):
             (generation / 'outputs/records.jsonl').write_text(json.dumps(records[0])+'\n')
             with self.assertRaisesRegex(ValueError, 'incomplete'):
                 run(evaluation_args, graded)
+
+    def test_full_cohort_metadata_interoperates_with_upstream(self) -> None:
+        """Compare a saved full cohort to canonical upstream metadata; keep subsets distinct."""
+        import hashlib
+        from types import SimpleNamespace
+        import evaluate as upstream
+        from utils.eval.compare import check
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suite, generation, output, baseline = [root/name for name in ('suite','gen','eval','base')]
+            for path in (suite, generation/'outputs', output/'outputs', baseline):
+                path.mkdir(parents=True)
+            question = dict(id='q',dataset='svamp',grader='numeric',answer='4',seed_index=0,
+                            messages=[dict(role='user',content='2+2?')])
+            def freeze(rows):
+                (suite/'questions.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in rows))
+                digest=hashlib.sha256((suite/'questions.jsonl').read_bytes()).hexdigest()
+                (suite/'manifest.json').write_text(json.dumps(dict(cohort_sha256=digest,total=len(rows),revisions={})))
+            freeze([question])
+            args=load_job(dict(command='generate',responses=1,max_model_len=8192,adapter='/candidate'))
+            (generation/'config.yaml').write_text(yaml.safe_dump(dict(arguments=args.config(),revisions=dict(model=dict(revision='a'*40)))))
+            (generation/'outputs/prompts.json').write_text(json.dumps([dict(question=question,token_ids=[1])]))
+            record=dict(id='q',dataset='svamp',sample_index=0,seed=9001,text='4',response='4',token_ids=[2],output_tokens=1,reasoning_tokens=0,truncated=False,boundary_error=False)
+            (generation/'outputs/records.jsonl').write_text(json.dumps(record)+'\n')
+            job=load_job(dict(command='evaluate',input=[str(generation)],questions=str(suite)))
+            run(job,output)
+            candidate=json.loads((output/'outputs/results.json').read_text())
+            options=SimpleNamespace(model=args.model,revision='a'*40,adapter=None,benchmarks=['svamp'],samples=1,seed=9001)
+            upstream.save_results(baseline,options,upstream.load_suite(suite),dict(mode='unused',why='numeric'),candidate['results'],{},dict(svamp=4096))
+            canonical=json.loads((baseline/'results.json').read_text())
+            self.assertEqual(check(canonical,candidate),['svamp'])
+            freeze([question,dict(question,id='extra',seed_index=1)])
+            run(job,output)
+            subset=json.loads((output/'outputs/results.json').read_text())
+            self.assertEqual(subset['selection'],'saved')
+            with self.assertRaisesRegex(ValueError,'selection'):
+                check(canonical,subset)

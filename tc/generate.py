@@ -130,11 +130,14 @@ class Generate(ModelJob):
                 raise ValueError("resume adapter identity is missing or differs")
             completed = completed_records(previous / "outputs/records.jsonl")
         jobs = pending_jobs(jobs, completed)
+        output_tokens = sum(len(row["token_ids"]) for row in completed)
         destination = directory / "outputs/records.jsonl"
         with destination.open("x") as stream:
             for item in completed:
                 stream.write(json.dumps(item) + "\n")
             stream.flush()
+            progress(directory, completed=len(completed), total=len(completed) + len(jobs),
+                     output_tokens=output_tokens)
             if not jobs:
                 artifacts.extend([destination, directory / "outputs/prompts.json", directory / "outputs/model-identity.json"])
                 return
@@ -166,8 +169,9 @@ class Generate(ModelJob):
                     row = upstream.to_record(job, output, lora, tokenizer, eos_ids, open_id, close_id)
                     row.update(token_ids=list(output.outputs[0].token_ids),
                                finish_reason=output.outputs[0].finish_reason)
+                    output_tokens += len(row["token_ids"])
                     stream.write(json.dumps(row) + "\n")
                     stream.flush()
                 progress(directory, completed=len(completed) + start + len(batch),
-                         total=len(completed) + len(jobs))
+                         total=len(completed) + len(jobs), output_tokens=output_tokens)
         artifacts.extend([destination, directory / "outputs/prompts.json", directory / "outputs/model-identity.json"])

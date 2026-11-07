@@ -65,6 +65,9 @@ class Evaluate(Job):
             for package in ("punkt_tab", "punkt"):
                 if not nltk.download(package, quiet=True):
                     raise RuntimeError(f"Missing IFEval resource: {package}")
+        full = bool(suite) and questions == read_rows(Path(self.questions) / "questions.jsonl")
+        cohort_hash = suite["cohort_sha256"] if full else hashlib.sha256(json.dumps(questions, sort_keys=True).encode()).hexdigest()
+        benchmark = {dataset: name for name, datasets in upstream.BENCHMARKS.items() for dataset in datasets}
         grading = upstream.grading_context(suite, options)
         upstream.grade_all(questions, records, grading)
         output = directory / "outputs"
@@ -75,11 +78,11 @@ class Evaluate(Job):
         caps = {q["dataset"]: upstream.token_cap(q["dataset"], SimpleNamespace(max_tokens=generated["max_tokens"]))
                 for q in questions}
         metadata = {"model": generated["model"], "revision": config["revisions"]["model"]["revision"],
-                    "adapter": generated["adapter"], "benchmarks": sorted({q["dataset"] for q in questions}),
+                    "adapter": generated["adapter"], "benchmarks": sorted({benchmark.get(q["dataset"], q["dataset"]) for q in questions}),
                     "samples": generated["responses"], "seed": generated["seed"], "sampling": sampling,
                     "max_tokens": caps, "max_model_len": generated["max_model_len"],
-                    "cohort_sha256": hashlib.sha256(json.dumps(questions, sort_keys=True).encode()).hexdigest(),
-                    "cohort_total": len(questions), "selection": "saved", "smoke": False,
+                    "cohort_sha256": cohort_hash,
+                    "cohort_total": len(questions), "selection": "full" if full else "saved", "smoke": False,
                     "revisions": suite.get("revisions", {}), "results": results, "failed_benchmarks": failed,
                     "sandbox": {"mode": grading["mode"], "why": grading["why"]}}
         write_json(output / "results.json", metadata)

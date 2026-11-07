@@ -73,6 +73,41 @@ class CollectorTests(unittest.TestCase):
                     collector.run()
                 self.assertEqual(saved.read_bytes(), b'{"answer": 42}\n')
 
+    def test_prebuilt_checkpoint_requires_valid_transfer_without_kernel_execution(self) -> None:
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            collector = Collector('session', 'job', '/job', '/console', '/diag', temp, '/sessions',
+                                  checkpoint_archives='/exports')
+            valid = False
+            def download(command, **kwargs):
+                self.assertNotIn('exec', command)
+                source, target = command[6:8]
+                target = Path(target)
+                code = 0
+                if source.endswith('status.json'):
+                    target.write_text(json.dumps(dict(job_id='job', state='running', checkpoint='checkpoints/step-49')))
+                elif source.endswith('checkpoint-49.tar.gz') and valid:
+                    with tarfile.open(target, 'w:gz') as archive:
+                        entry = tarfile.TarInfo('step-49/state.pt')
+                        entry.size = 7
+                        archive.addfile(entry, io.BytesIO(b'resume!'))
+                elif source.endswith('terminal.json') or source.endswith('log.txt'):
+                    code = 1
+                else:
+                    target.write_bytes(b'incomplete archive')
+                return subprocess.CompletedProcess(command, code, b'', b'')
+            with patch('tc.collector.subprocess.run', side_effect=download), patch('tc.collector.time.sleep', side_effect=InterruptedError):
+                with self.assertRaises(InterruptedError):
+                    collector.run()
+                self.assertFalse((root/'checkpoint-49.tar.gz').exists())
+                valid = True
+                with self.assertRaises(InterruptedError):
+                    collector.run()
+                with tarfile.open(root/'checkpoint-49.tar.gz') as archive:
+                    self.assertEqual(archive.extractfile('step-49/state.pt').read(), b'resume!')
+
     def test_final_archive_includes_external_console(self) -> None:
         import tarfile
         with tempfile.TemporaryDirectory() as temp:

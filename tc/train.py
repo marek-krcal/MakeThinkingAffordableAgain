@@ -151,20 +151,34 @@ class Train(ModelJob):
             for offset in range(start, len(schedule)):
                 check_stop(directory)
                 step, batch = offset + 1, schedule[offset]
-                optimizer.zero_grad(set_to_none=True)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = learning_rate(step, len(schedule), self.learning_rate)
-                micro_size = max(1, (len(batch) + self.gradient_accumulation - 1) // self.gradient_accumulation)
-                loss_value = 0.
-                for begin in range(0, len(batch), micro_size):
-                    with torch.autocast(device_type="cuda" if cuda else "cpu", dtype=torch.float16, enabled=cuda):
-                        losses = [group_loss(model, group, algorithm=self.algorithm, beta=self.beta, gamma=self.gamma)
-                                  for group in batch[begin:begin + micro_size]]
-                        loss = torch.stack(losses).sum() / len(batch)
-                    loss_value += float(loss.detach())
-                    scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1., error_if_nonfinite=True)
+                random_state = torch.get_rng_state()
+                cuda_state = torch.cuda.get_rng_state_all() if cuda else []
+                for attempt in range(17):
+                    optimizer.zero_grad(set_to_none=True)
+                    torch.set_rng_state(random_state)
+                    if cuda:
+                        torch.cuda.set_rng_state_all(cuda_state)
+                    micro_size = max(1, (len(batch) + self.gradient_accumulation - 1) // self.gradient_accumulation)
+                    loss_value = 0.
+                    for begin in range(0, len(batch), micro_size):
+                        with torch.autocast(device_type="cuda" if cuda else "cpu", dtype=torch.float16, enabled=cuda):
+                            losses = [group_loss(model, group, algorithm=self.algorithm, beta=self.beta, gamma=self.gamma)
+                                      for group in batch[begin:begin + micro_size]]
+                            loss = torch.stack(losses).sum() / len(batch)
+                        loss_value += float(loss.detach())
+                        scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    parameters = [p for p in model.parameters() if p.requires_grad]
+                    if all(torch.isfinite(p.grad).all() for p in parameters if p.grad is not None):
+                        torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
+                        break
+                    if not scaler.is_enabled() or attempt == 16:
+                        raise FloatingPointError("nonfinite gradients after loss-scale recovery")
+                    scaler.step(optimizer)  # Nonfinite gradients skip this optimizer step.
+                    scaler.update()
+                    print(f"retry update {step}: loss scale {scaler.get_scale()}", flush=True)
                 scaler.step(optimizer)
                 scaler.update()
                 if step in retained or step % self.checkpoint_every == 0 or step == len(schedule):

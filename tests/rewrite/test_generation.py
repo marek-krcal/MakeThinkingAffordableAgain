@@ -86,4 +86,6 @@ class DurableResumeTests(unittest.TestCase):
                 (previous/'outputs/model-identity.json').write_text(json.dumps(identity))
                 self.assertEqual(job.execute(), current)
                 self.assertEqual(json.loads((current/'outputs/records.jsonl').read_text()), response)
+                status = json.loads((current/'status.json').read_text())
+                self.assertEqual((status['completed'], status['total'], status['output_tokens']), (1, 1, 1))
                 fake.LLM.assert_not_called()

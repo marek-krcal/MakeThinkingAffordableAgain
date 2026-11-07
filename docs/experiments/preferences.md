@@ -18,7 +18,6 @@ The expanded run generates eight answers for 2,000 audited candidates: 575 code 
 
 The `all-longer` variant sets `wrong_ratio: 1.5`: both wrong and correct negatives must be at least 1.5× the positive token length. The `correct-longer` variant keeps `wrong_ratio: 1.0` and requires wrong negatives to be strictly longer. Run `all-longer` SimPO after DPO and before the external mixture.
 
-
 New evaluations use one answer per question across the full frozen cohort. Retain steps 737, 860 (checkpoint 3.5), and 982; reserve eight-answer evaluations for later user selection. Compare against a matched one-answer Qwen baseline; preserve earlier eight-answer results separately. Training-data generation still samples eight answers per question.
 
 Keep one rolling safety checkpoint during training; delete it after successful training. Requested evaluation steps and the final checkpoint remain. Failures preserve recovery state.
@@ -26,3 +25,5 @@ Keep one rolling safety checkpoint during training; delete it after successful t
 `prepare-external` replays selection from audited question JSONL artifacts. Its `sources` JSON manifest binds each artifact and audit to the raw source revision/hash, license and protected cohort hash; code sources also provide validated fixture JSONL. `protected` points to the frozen suite, and `count` defaults to 200 per domain. Curation scripts and fixture proofs accompany the input artifacts.
 
 Instruction selection matches aggregate prompt length and constraint count; domains are then interleaved without changing source seeds. The job copies grader code into a separate training suite and removes held-out question assets. Training code labels use three original source cases, not expanded MBPP+ tests; full evaluation remains unchanged.
+
+An explicit continuation sets `resume`, `extend_from_steps: 982` and a larger `steps` budget. It restores optimizer/RNG state, preserves the original batch sequence and partial-batch pattern, and extends the learning-rate horizon; other scientific settings must match. The DPO continuation branches from step 737 to 1473 at the same peak LR and β, separately from the original reproduction.

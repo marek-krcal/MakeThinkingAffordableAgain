@@ -80,12 +80,14 @@ def views(group: dict[str, Any], epoch: int) -> Any:
     return result
 
 
-def batches(groups: list[dict[str, Any]], *, seed: int, batch_size: int, steps: int | None = None, epochs: int | None = None) -> Any:
+def batches(groups: list[dict[str, Any]], *, seed: int, batch_size: int, steps: int | None = None, epochs: int | None = None, initial_steps: int | None = None) -> Any:
     """Construct deterministic update batches with the requested exposure schedule."""
     if not groups or len({g["id"] for g in groups}) != len(groups):
         raise ValueError("unique nonempty groups required")
     if (steps is None) == (epochs is None) or batch_size < 1:
         raise ValueError("choose steps or epochs and a positive batch size")
+    if initial_steps is not None and (steps is None or not 0 < initial_steps < steps):
+        raise ValueError("initial schedule must be shorter than the extended step budget")
     pending, result, epoch = [], [], 0
     while (len(result) < steps if steps is not None else epoch < epochs):
         current = [view for group in groups for view in views(group, epoch)]
@@ -98,7 +100,7 @@ def batches(groups: list[dict[str, Any]], *, seed: int, batch_size: int, steps: 
             continue
         pending.extend(current)
         while len(result) < steps:
-            size = 6 if steps == 982 and batch_size == 8 and len(result) + 1 in (491, 982) else batch_size
+            size = 6 if (initial_steps or steps) == 982 and batch_size == 8 and (len(result) + 1) % 491 == 0 else batch_size
             if len(pending) < size:
                 break
             result.append(pending[:size])

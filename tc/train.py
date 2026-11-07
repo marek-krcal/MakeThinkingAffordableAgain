@@ -35,7 +35,20 @@ def restore_checkpoint(path: Path, model: Any, optimizer: Any, scaler: Any, iden
     from peft import load_peft_weights, set_peft_model_state_dict
 
     state = torch.load(Path(path) / "state.pt", map_location="cpu", weights_only=True)
-    if state["identity"] != identity:
+    expected = identity
+    initial_steps = identity["arguments"].get("extend_from_steps")
+    if state["identity"] != identity and initial_steps is not None:
+        arguments = dict(identity["arguments"])
+        arguments.pop("extend_from_steps")
+        arguments["steps"] = initial_steps
+        groups = arguments.get("groups", {})
+        if ("wrong_ratio" not in state["identity"]["arguments"].get("groups", {})
+                and groups.get("pairing") == "all" and groups.get("wrong_ratio") == 1.):
+            arguments["groups"] = {k: v for k, v in groups.items() if k != "wrong_ratio"}
+        expected = dict(identity, arguments=arguments)
+        if not 0 < state["step"] <= initial_steps < identity["arguments"]["steps"]:
+            raise ValueError("invalid checkpoint schedule extension")
+    if state["identity"] != expected:
         raise ValueError("checkpoint training settings or input differ")
     set_peft_model_state_dict(model, load_peft_weights(path, device="cpu"))
     optimizer.load_state_dict(state["optimizer"])
@@ -69,6 +82,7 @@ class Train(ModelJob):
     gamma: float | None = None
     steps: int | None = None
     epochs: int | None = None
+    extend_from_steps: int | None = None
     learning_rate: float = 1e-6
     weight_decay: float = .01
     batch_size: int = 8
@@ -82,7 +96,7 @@ class Train(ModelJob):
         if isinstance(self.groups, dict):
             self.groups = PreferenceGroups(**self.groups)
         super().__post_init__()
-        self.require_positive("steps", "epochs", "checkpoint_every", "batch_size",
+        self.require_positive("steps", "epochs", "extend_from_steps", "checkpoint_every", "batch_size",
                               "gradient_accumulation", "lora_rank", "lora_alpha")
         if self.retain_step is not None and any(step <= 0 for step in self.retain_step):
             raise ValueError("retain_step must contain positive steps")
@@ -92,6 +106,9 @@ class Train(ModelJob):
             raise ValueError("choose steps or epochs")
         if self.steps is None and self.epochs is None:
             self.steps = 982
+        if self.extend_from_steps is not None and (
+                not self.resume or self.epochs is not None or self.steps <= self.extend_from_steps):
+            raise ValueError("schedule extension requires a checkpoint and a larger step budget")
         if self.algorithm == "dpo" and self.gamma is not None:
             raise ValueError("gamma is only supported by SimPO")
         self.beta = self.beta if self.beta is not None else (2. if self.algorithm == "simpo" else .1)
@@ -128,14 +145,15 @@ class Train(ModelJob):
                                                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]))
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         excluded = {"input", "resume", "name", "jobs_dir", "local", "checkpoint_every", "retain_step"}
-        arguments = {k: v for k, v in record["arguments"].items() if k not in excluded}
+        arguments = {k: v for k, v in record["arguments"].items() if k not in excluded
+                     and not (k == "extend_from_steps" and v is None)}
         arguments["groups"] = {k: v for k, v in arguments["groups"].items() if k != "input"}
         identity = {"arguments": arguments,
                     "revisions": record["revisions"],
                     "input_sha256": hashlib.sha256(json.dumps(groups, sort_keys=True).encode()).hexdigest()}
         with (directory / "log.txt").open("x") as log:
             schedule = batches(groups, seed=self.seed, batch_size=self.batch_size,
-                               steps=self.steps, epochs=self.epochs)
+                               steps=self.steps, epochs=self.epochs, initial_steps=self.extend_from_steps)
             optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                          lr=self.learning_rate, weight_decay=self.weight_decay)
             cuda = next(model.parameters()).device.type == "cuda"

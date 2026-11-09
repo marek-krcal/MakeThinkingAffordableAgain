@@ -1,6 +1,6 @@
 """Public job classes and YAML configuration loader."""
 
-from tc.config import Job, ModelJob, load_job
+from tc.job import Job, ModelJob, load_job
 from tc.prepare import Prepare
 from tc.generate import Generate
 from tc.train import Train

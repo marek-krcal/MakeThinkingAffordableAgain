@@ -11,45 +11,44 @@ GSM8K / Skywork, "multiple_choice" for CommonsenseQA / ARC Easy), all as lists o
 
 For a single reply, is_task_correct(reply, "42", "math") returns True or False.
 
-This is more forgiving than utils/eval/graders.py, which scores the benchmarks: it
-accepts \boxed{42} and friends where the evaluation wants a bare number. Each
-matches the prompt it was written for, so a high reward here does not by itself
-predict a high benchmark score -- check how your model formats its answers
-before reading too much into either number.
+Math uses the evaluation plain-number and thinking-boundary rules.
+Multiple-choice tasks retain their label extraction and formatting tolerance.
 """
 
 import re
-from fractions import Fraction
+from itertools import repeat
+
+from utils.eval.graders import grade_numeric
 
 FINAL_ANSWER = re.compile(r"^Final answer:[ \t]*([^\n]+?)[ \t]*$", re.MULTILINE)
 CHOICE_LABEL = re.compile(r"\(?([A-Za-z0-9])\b\)?")
 ANSWER_TAG = re.compile(r"</?answer>")
 LATEX_WRAPPER = re.compile(r"\\(?:boxed|text)\{(.*)\}")
-DEGREES = re.compile(r"(?:°|\^\\circ|\^\{\\circ\})$")
 
 
-def correctness(completions, answer, task, **kwargs):
+def correctness(completions, answer, task, truncated=None, **kwargs):
     """Batch of completions -> list of 1.0 (correct) / 0.0 (wrong); usable as a reward function.
 
     A completion is a string or, as trainers pass it for chat prompts, a list of messages.
     """
-    return [float(is_task_correct(text_of(completion), gold, kind))
-            for completion, gold, kind in zip(completions, answer, task)]
+    flags = repeat(False) if truncated is None else iter(truncated)
+    return [float(is_task_correct(text_of(completion), gold, kind, capped))
+            for completion, gold, kind, capped in zip(completions, answer, task, flags)]
 
 
 def text_of(completion):
     return completion if isinstance(completion, str) else completion[-1]["content"]
 
 
-def is_task_correct(completion, answer, task):
+def is_task_correct(completion, answer, task, truncated=False):
     """One completion -> True if its final answer matches; task is "math" or "multiple_choice"."""
+    if task == "math":
+        return grade_numeric(completion, answer, truncated)[0]
     response = completion.split("</think>")[-1]
     predicted = final_answer(response.replace("**", ""))
     if predicted is None:
         return False
     predicted = clean_answer(predicted)
-    if task == "math":
-        return same_number(predicted, answer)
     if task == "multiple_choice":
         return same_choice(predicted, answer)
     raise ValueError(f"Unknown task: {task!r}")
@@ -76,25 +75,6 @@ def clean_answer(text):
     return text
 
 
-def same_number(predicted, answer):
-    predicted_value, answer_value = to_number(predicted), to_number(answer)
-    if predicted_value is None or answer_value is None:
-        return normalize(predicted) == normalize(answer)
-    return predicted_value == answer_value
-
-
-def to_number(text):
-    text = DEGREES.sub("", text.replace(",", "").replace("$", "").strip())
-    try:
-        return Fraction(text)
-    except (ValueError, ZeroDivisionError):
-        return None
-
-
 def same_choice(predicted, answer):
     label = CHOICE_LABEL.match(predicted)
     return label is not None and label.group(1).upper() == answer.strip().upper()
-
-
-def normalize(text):
-    return " ".join(text.casefold().split())

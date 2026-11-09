@@ -26,8 +26,9 @@ class Collector:
     auth: str = 'oauth2'
     resume_step: int = 0
     total_steps: int = 982
-    retain_steps: list[int] = field(default_factory=lambda: [737, 982])
+    retain_steps: list[int] = field(default_factory=lambda: [737, 860, 982])
     snapshot_files: list[str] = field(default_factory=list)
+    checkpoint_archives: str | None = None
     interval: float = 90
 
     def save(self, path: str | Path) -> None:
@@ -45,11 +46,11 @@ class Collector:
         JOB=self.remote_job_dir
         CLI=[self.executable,'--auth',self.auth,'--config',self.session_file]
         ENV=os.environ.copy()
-        def call(*args: str) -> bool:
+        def call(*args: str, timeout: int = 180) -> bool:
             """Run a session-specific command and record redacted transport failures."""
             record={'time':time.time(),'operation':args[0]}
             try:
-                p=subprocess.run(CLI+list(args)+['--session',SESSION],env=ENV,capture_output=True,timeout=180)
+                p=subprocess.run(CLI+list(args)+['--session',SESSION],env=ENV,capture_output=True,timeout=timeout)
                 record['returncode']=p.returncode
                 if p.returncode:
                     message=(p.stdout+p.stderr).decode(errors='replace')[-4000:]
@@ -59,7 +60,7 @@ class Collector:
                     record['error']=message
                 return p.returncode==0
             except subprocess.TimeoutExpired:
-                record['error']='TimeoutExpired after 180 seconds'
+                record['error']=f'TimeoutExpired after {timeout} seconds'
                 return False
             finally:
                 with (OUT/'transport.jsonl').open('a') as stream:
@@ -84,9 +85,11 @@ class Collector:
             script=OUT/'archive_remote.py'
             script.write_text(archive_script(remote, '/content/'+name+'.tar.gz',
                                              self.remote_console if remote == self.remote_diagnostics else None))
-            if not call('exec','--file',str(script)): return False
+            prebuilt = self.checkpoint_archives if name.startswith('checkpoint-') else None
+            if not prebuilt and not call('exec','--timeout','120','--file',str(script)): return False
+            remote_archive = str(Path(prebuilt) / (name+'.tar.gz')) if prebuilt else '/content/'+name+'.tar.gz'
             temporary=destination.with_suffix('.partial')
-            if not call('download','/content/'+name+'.tar.gz',str(temporary)): return False
+            if not call('download',remote_archive,str(temporary),timeout=900): return False
             import tarfile
             try:
                 with tarfile.open(temporary) as t:
@@ -122,7 +125,6 @@ class Collector:
                     (OUT/'monitor.json').write_text(json.dumps({'state':'connection_retry','failures':failures,'time':time.time()}))
                     if failures >= 5:
                         (OUT/'monitor.json').write_text(json.dumps({'state':'connection_lost','session':SESSION,'failures':failures,'time':time.time(),'recovery':'recurring monitor must reconcile and recover'}))
-                        break
                     time.sleep(60); continue
             else:
                 status=json.loads(temporary.read_text())
@@ -148,13 +150,32 @@ class Collector:
                 snapshot['interval_updates_per_hour']=(step-previous[1])*3600/(now-previous[0])
             with (OUT/'throughput.jsonl').open('a') as history: history.write(json.dumps(snapshot)+'\n')
             checkpoint=status.get('checkpoint')
+            checkpoint_copies_ready=True
             if checkpoint:
-                step=int(checkpoint.split('-')[-1])
-                if archive('checkpoint-'+str(step),JOB+'/'+checkpoint):
+                latest=int(checkpoint.split('-')[-1])
+                targets={latest}
+                if self.checkpoint_archives:
+                    configuration=OUT/'job-config.yaml'
+                    if not configuration.exists() and not fetch(JOB+'/config.yaml', 'job-config.yaml'):
+                        checkpoint_copies_ready=False
+                    settings=(yaml.safe_load(configuration.read_text()) or {}) if configuration.exists() else {}
+                    stride=settings.get('arguments', {}).get('checkpoint_every')
+                    if isinstance(stride, int) and stride>0:
+                        completed=status.get('step', latest)
+                        safety=[n for n in range(stride, completed+1, stride) if n>self.resume_step and n not in self.retain_steps]
+                        if status['state'] != 'completed':
+                            targets.update(safety[-1:])
+                        targets.update(n for n in self.retain_steps if self.resume_step<n<=completed)
+                for number in sorted(targets):
+                    source=JOB+'/'+checkpoint if number==latest else JOB+'/checkpoints/step-'+str(number)
+                    if not archive('checkpoint-'+str(number),source): checkpoint_copies_ready=False
+                if checkpoint_copies_ready:
                     safety=sorted((p for p in OUT.glob('checkpoint-*.tar.gz') if int(p.name.split('-')[1].split('.')[0]) not in self.retain_steps),key=lambda p:int(p.name.split('-')[1].split('.')[0]))
-                    for old in safety[:-2]: old.unlink()
+                    keep=safety[-1:] if status['state']!='completed' else [p for p in safety if p.name==f'checkpoint-{latest}.tar.gz']
+                    for old in safety:
+                        if old not in keep: old.unlink()
             (OUT/'monitor.json').write_text(json.dumps({'state':'monitoring','session':SESSION,'training_state':status['state'],'step':status.get('step',0),'time':time.time(),'remaining_seconds':snapshot['remaining_seconds'],'updates_per_hour':snapshot['updates_per_hour']}))
-            if status['state'] in ('completed','failed','interrupted'):
+            if status['state'] in ('completed','failed','interrupted') and checkpoint_copies_ready:
                 if finish(status, fetch, archive, call, JOB, RUN['remote_console'], RUN['remote_diagnostics']):
                     (OUT/'monitor.json').write_text(json.dumps({'state':'archived','training_state':status['state'],'released':True,'time':time.time()}))
                     break

@@ -41,11 +41,59 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(learning_rate(982, 982, 1.), 0.)
         self.assertTrue(all(len(b) == 8 for b in batches(groups(), seed=42, batch_size=8, steps=500)))
 
+    def test_extension_preserves_original_batches_and_continues_exposure(self):
+        original = batches(groups(), seed=42, batch_size=8, steps=982)
+        extended = batches(groups(), seed=42, batch_size=8, steps=1473, initial_steps=982)
+        self.assertEqual(extended[:982], original)
+        self.assertEqual(sum(map(len, extended)), 3 * sum(map(len, original)) // 2)
+        self.assertEqual(sum(map(len, extended[737:])), 5884)
+        self.assertEqual([i+1 for i, batch in enumerate(extended) if len(batch) == 6], [491, 982, 1473])
+        self.assertGreater(learning_rate(982, 1473, 1.), learning_rate(982, 982, 1.))
+        self.assertEqual(learning_rate(1473, 1473, 1.), 0.)
+
+    def test_explicit_extension_restores_state_but_rejects_other_changes(self):
+        from copy import deepcopy
+        from tc.train import save_checkpoint, restore_checkpoint
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'checkpoint'
+            trained = model()
+            optimizer = torch.optim.AdamW(p for p in trained.parameters() if p.requires_grad)
+            for _ in range(2):
+                optimizer.zero_grad()
+                sum(p.sum() for p in trained.parameters() if p.requires_grad).backward()
+                optimizer.step()
+            scaler = torch.amp.GradScaler('cpu', enabled=False)
+            identity = dict(arguments=dict(steps=4, epochs=None, beta=.1, groups=dict(pairing='all')),
+                            revisions=dict(model='pinned'), input_sha256='frozen')
+            save_checkpoint(path, trained, optimizer, scaler, 2, identity)
+            expected_rng = torch.get_rng_state()
+            extended = deepcopy(identity)
+            extended['arguments'].update(steps=6, extend_from_steps=4)
+            extended['arguments']['groups']['wrong_ratio'] = 1.
+            restored = model()
+            other_optimizer = torch.optim.AdamW(p for p in restored.parameters() if p.requires_grad)
+            self.assertEqual(restore_checkpoint(path, restored, other_optimizer, scaler, extended), 2)
+            self.assertTrue(torch.equal(torch.get_rng_state(), expected_rng))
+            self.assertEqual(len(other_optimizer.state), len(optimizer.state))
+            for actual, expected in zip(other_optimizer.state.values(), optimizer.state.values()):
+                for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                    torch.testing.assert_close(actual[key], expected[key], atol=0, rtol=0)
+            for (name, expected), (_, actual) in zip(trained.named_parameters(), restored.named_parameters()):
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0, msg=name)
+            for change in ('beta', 'input', 'implicit', 'pairing'):
+                changed = deepcopy(extended)
+                if change == 'beta': changed['arguments']['beta'] = .2
+                elif change == 'input': changed['input_sha256'] = 'different'
+                elif change == 'pairing': changed['arguments']['groups']['wrong_ratio'] = 1.5
+                else: changed['arguments'].pop('extend_from_steps')
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    restore_checkpoint(path, restored, other_optimizer, scaler, changed)
+
     def test_both_algorithms_resume_exactly(self):
         for algorithm in ('simpo', 'dpo'):
             with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                args = load_job({'command': 'train', 'algorithm': algorithm, 'steps': 4, 'batch_size': 2, 'checkpoint_every': 1, 'retain_step': [2], 'learning_rate': 0.001, 'device': 'cpu'})
+                args = load_job({'command': 'train', 'algorithm': algorithm, 'steps': 4, 'batch_size': 2, 'checkpoint_every': 1, 'retain_step': [1], 'learning_rate': 0.001, 'device': 'cpu'})
                 full, interrupted, resumed = [root / name for name in ('full', 'interrupted', 'resumed')]
                 for path in (full, interrupted, resumed):
                     (path / 'outputs').mkdir(parents=True)
@@ -61,7 +109,10 @@ class TrainingTests(unittest.TestCase):
                         return models[-1]
                     def update(path, **fields):
                         progress(path, **fields)
-                        if interrupt and fields.get('step') == 2:
+                        if fields.get('step'):
+                            safety = [p.name for p in (path/'checkpoints').glob('step-*') if p.name not in ('step-1', 'step-4')]
+                            self.assertLessEqual(len(safety), 1)
+                        if interrupt and fields.get('step') == 3:
                             raise InterruptedError()
                     with patch('tc.preferences.PreferenceGroups.form_groups', return_value=groups()), patch.object(args, 'execution_context', execution), patch('transformers.AutoModelForCausalLM.from_pretrained', load), patch('peft.get_peft_model', side_effect=lambda m, c: m), patch('tc.train.progress', update):
                         args.execute()
@@ -72,7 +123,44 @@ class TrainingTests(unittest.TestCase):
                 self.assertTrue(any(not torch.equal(initial[n], p) for n, p in original.named_parameters() if n in initial))
                 with self.assertRaises(InterruptedError):
                     run(interrupted, interrupt=True)
-                args.resume = str(interrupted / 'checkpoints/step-2')
+                self.assertEqual({p.name for p in (full/'checkpoints').iterdir()}, {'step-1', 'step-4'})
+                self.assertEqual({p.name for p in (interrupted/'checkpoints').iterdir()}, {'step-1', 'step-3'})
+                args.resume = str(interrupted / 'checkpoints/step-3')
                 recovered = run(resumed)
                 for (name, expected), (_, actual) in zip(original.named_parameters(), recovered.named_parameters()):
                     torch.testing.assert_close(expected, actual, atol=0, rtol=0, msg=name)
+
+    def test_loss_scale_overflow_retries_without_consuming_an_update(self):
+        scaler_class = torch.amp.GradScaler
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = load_job(dict(command='train', steps=4, batch_size=2, checkpoint_every=4, device='cpu', learning_rate=.001))
+            def run(name, overflow):
+                directory = root / name
+                (directory / 'outputs').mkdir(parents=True)
+                instances = []
+                injected = []
+                def load(*a, **kw):
+                    current = model()
+                    if overflow:
+                        parameter = next(p for p in current.parameters() if p.requires_grad)
+                        def corrupt_once(gradient):
+                            if not injected:
+                                injected.append(True)
+                                return torch.full_like(gradient, float('inf'))
+                            return gradient
+                        parameter.register_hook(corrupt_once)
+                    instances.append(current)
+                    return current
+                @contextmanager
+                def execution():
+                    yield ExecutionContext(directory, dict(arguments=args.config(), revisions={"model": {"id": "test", "revision": "a"*40}}))
+                with patch.object(args, 'execution_context', execution), patch('tc.preferences.PreferenceGroups.form_groups', return_value=groups()), patch('transformers.AutoModelForCausalLM.from_pretrained', load), patch('peft.get_peft_model', side_effect=lambda m,c:m), patch('torch.amp.GradScaler', side_effect=lambda *a,**kw:scaler_class('cpu', init_scale=8.)):
+                    args.execute()
+                self.assertEqual(len((directory/'log.txt').read_text().splitlines()), 4)
+                if overflow:
+                    self.assertEqual(injected, [True])
+                return instances[0]
+            baseline, recovered = run('baseline', False), run('overflow', True)
+            for (_, expected), (_, actual) in zip(baseline.named_parameters(), recovered.named_parameters()):
+                torch.testing.assert_close(expected, actual, atol=0, rtol=0)

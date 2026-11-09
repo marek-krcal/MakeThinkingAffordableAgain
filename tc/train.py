@@ -35,7 +35,20 @@ def restore_checkpoint(path: Path, model: Any, optimizer: Any, scaler: Any, iden
     from peft import load_peft_weights, set_peft_model_state_dict
 
     state = torch.load(Path(path) / "state.pt", map_location="cpu", weights_only=True)
-    if state["identity"] != identity:
+    expected = identity
+    initial_steps = identity["arguments"].get("extend_from_steps")
+    if state["identity"] != identity and initial_steps is not None:
+        arguments = dict(identity["arguments"])
+        arguments.pop("extend_from_steps")
+        arguments["steps"] = initial_steps
+        groups = arguments.get("groups", {})
+        if ("wrong_ratio" not in state["identity"]["arguments"].get("groups", {})
+                and groups.get("pairing") == "all" and groups.get("wrong_ratio") == 1.):
+            arguments["groups"] = {k: v for k, v in groups.items() if k != "wrong_ratio"}
+        expected = dict(identity, arguments=arguments)
+        if not 0 < state["step"] <= initial_steps < identity["arguments"]["steps"]:
+            raise ValueError("invalid checkpoint schedule extension")
+    if state["identity"] != expected:
         raise ValueError("checkpoint training settings or input differ")
     set_peft_model_state_dict(model, load_peft_weights(path, device="cpu"))
     optimizer.load_state_dict(state["optimizer"])
@@ -69,6 +82,7 @@ class Train(ModelJob):
     gamma: float | None = None
     steps: int | None = None
     epochs: int | None = None
+    extend_from_steps: int | None = None
     learning_rate: float = 1e-6
     weight_decay: float = .01
     batch_size: int = 8
@@ -82,7 +96,7 @@ class Train(ModelJob):
         if isinstance(self.groups, dict):
             self.groups = PreferenceGroups(**self.groups)
         super().__post_init__()
-        self.require_positive("steps", "epochs", "checkpoint_every", "batch_size",
+        self.require_positive("steps", "epochs", "extend_from_steps", "checkpoint_every", "batch_size",
                               "gradient_accumulation", "lora_rank", "lora_alpha")
         if self.retain_step is not None and any(step <= 0 for step in self.retain_step):
             raise ValueError("retain_step must contain positive steps")
@@ -92,6 +106,9 @@ class Train(ModelJob):
             raise ValueError("choose steps or epochs")
         if self.steps is None and self.epochs is None:
             self.steps = 982
+        if self.extend_from_steps is not None and (
+                not self.resume or self.epochs is not None or self.steps <= self.extend_from_steps):
+            raise ValueError("schedule extension requires a checkpoint and a larger step budget")
         if self.algorithm == "dpo" and self.gamma is not None:
             raise ValueError("gamma is only supported by SimPO")
         self.beta = self.beta if self.beta is not None else (2. if self.algorithm == "simpo" else .1)
@@ -128,14 +145,15 @@ class Train(ModelJob):
                                                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]))
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         excluded = {"input", "resume", "name", "jobs_dir", "local", "checkpoint_every", "retain_step"}
-        arguments = {k: v for k, v in record["arguments"].items() if k not in excluded}
+        arguments = {k: v for k, v in record["arguments"].items() if k not in excluded
+                     and not (k == "extend_from_steps" and v is None)}
         arguments["groups"] = {k: v for k, v in arguments["groups"].items() if k != "input"}
         identity = {"arguments": arguments,
                     "revisions": record["revisions"],
                     "input_sha256": hashlib.sha256(json.dumps(groups, sort_keys=True).encode()).hexdigest()}
         with (directory / "log.txt").open("x") as log:
             schedule = batches(groups, seed=self.seed, batch_size=self.batch_size,
-                               steps=self.steps, epochs=self.epochs)
+                               steps=self.steps, epochs=self.epochs, initial_steps=self.extend_from_steps)
             optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                          lr=self.learning_rate, weight_decay=self.weight_decay)
             cuda = next(model.parameters()).device.type == "cuda"
@@ -146,25 +164,40 @@ class Train(ModelJob):
             checkpoint_dir = Path(directory) / "checkpoints"
             checkpoint_dir.mkdir()
             retained = set(self.retain_step if self.retain_step is not None else
-                           ([737, 982] if len(schedule) == 982 else [len(schedule)]))
+                           ([737, 860, 982] if len(schedule) == 982 else [len(schedule)]))
+            retained.add(len(schedule))
             model.train()
             for offset in range(start, len(schedule)):
                 check_stop(directory)
                 step, batch = offset + 1, schedule[offset]
-                optimizer.zero_grad(set_to_none=True)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = learning_rate(step, len(schedule), self.learning_rate)
-                micro_size = max(1, (len(batch) + self.gradient_accumulation - 1) // self.gradient_accumulation)
-                loss_value = 0.
-                for begin in range(0, len(batch), micro_size):
-                    with torch.autocast(device_type="cuda" if cuda else "cpu", dtype=torch.float16, enabled=cuda):
-                        losses = [group_loss(model, group, algorithm=self.algorithm, beta=self.beta, gamma=self.gamma)
-                                  for group in batch[begin:begin + micro_size]]
-                        loss = torch.stack(losses).sum() / len(batch)
-                    loss_value += float(loss.detach())
-                    scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1., error_if_nonfinite=True)
+                random_state = torch.get_rng_state()
+                cuda_state = torch.cuda.get_rng_state_all() if cuda else []
+                for attempt in range(17):
+                    optimizer.zero_grad(set_to_none=True)
+                    torch.set_rng_state(random_state)
+                    if cuda:
+                        torch.cuda.set_rng_state_all(cuda_state)
+                    micro_size = max(1, (len(batch) + self.gradient_accumulation - 1) // self.gradient_accumulation)
+                    loss_value = 0.
+                    for begin in range(0, len(batch), micro_size):
+                        with torch.autocast(device_type="cuda" if cuda else "cpu", dtype=torch.float16, enabled=cuda):
+                            losses = [group_loss(model, group, algorithm=self.algorithm, beta=self.beta, gamma=self.gamma)
+                                      for group in batch[begin:begin + micro_size]]
+                            loss = torch.stack(losses).sum() / len(batch)
+                        loss_value += float(loss.detach())
+                        scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    parameters = [p for p in model.parameters() if p.requires_grad]
+                    if all(torch.isfinite(p.grad).all() for p in parameters if p.grad is not None):
+                        torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
+                        break
+                    if not scaler.is_enabled() or attempt == 16:
+                        raise FloatingPointError("nonfinite gradients after loss-scale recovery")
+                    scaler.step(optimizer)  # Nonfinite gradients skip this optimizer step.
+                    scaler.update()
+                    print(f"retry update {step}: loss scale {scaler.get_scale()}", flush=True)
                 scaler.step(optimizer)
                 scaler.update()
                 if step in retained or step % self.checkpoint_every == 0 or step == len(schedule):
@@ -172,10 +205,13 @@ class Train(ModelJob):
                     progress(directory, checkpoint=f"checkpoints/step-{step}")
                     safety = sorted((p for p in checkpoint_dir.glob("step-*") if int(p.name[5:]) not in retained),
                                     key=lambda p: int(p.name[5:]))
-                    for old in safety[:-2]:
+                    for old in safety[:-1]:
                         shutil.rmtree(old)
                 log.write(json.dumps({"step": step, "loss": loss_value}) + "\n")
                 log.flush()
                 progress(directory, step=step, total_steps=len(schedule), loss=loss_value)
             model.save_pretrained(Path(directory) / "outputs/adapter")
+            for checkpoint in checkpoint_dir.glob("step-*"):
+                if int(checkpoint.name[5:]) not in retained:
+                    shutil.rmtree(checkpoint)
             artifacts.extend([Path(directory) / "outputs/adapter", checkpoint_dir])

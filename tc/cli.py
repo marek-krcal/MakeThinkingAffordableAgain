@@ -13,6 +13,10 @@ def parse_args(argv: list[str] | None = None) -> Job | SimpleNamespace:
     """Load one YAML job or parse an explicit monitoring command."""
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if argv and argv[0] in ("status", "watch", "stop"):
+            if len(argv) not in (2, 3):
+                raise ValueError("usage: python -m tc {status,watch,stop} JOB_ID [JOBS_DIR]")
+            return SimpleNamespace(command=argv[0], job_id=argv[1], jobs_dir=argv[2] if len(argv) == 3 else "runs")
         names = [arg[7:] for arg in argv if arg.startswith("--name=")]
         paths = [arg for arg in argv if not arg.startswith("--name=")]
         if len(paths) != 1 or len(names) > 1 or paths[0].startswith("-"):

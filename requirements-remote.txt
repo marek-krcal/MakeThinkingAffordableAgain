@@ -1,0 +1,3 @@
+-r requirements-tc.txt
+google-api-python-client==2.201.0
+google-colab-cli==0.7.5
